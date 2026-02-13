@@ -1,0 +1,1289 @@
+"use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.Wallet = exports.ReadonlyWallet = void 0;
+exports.getSequence = getSequence;
+exports.waitForIncomingFunds = waitForIncomingFunds;
+const base_1 = require("@scure/base");
+const bip68 = __importStar(require("bip68"));
+const payment_js_1 = require("@scure/btc-signer/payment.js");
+const btc_signer_1 = require("@scure/btc-signer");
+const utils_js_1 = require("@scure/btc-signer/utils.js");
+const address_1 = require("../script/address");
+const default_1 = require("../script/default");
+const networks_1 = require("../networks");
+const onchain_1 = require("../providers/onchain");
+const ark_1 = require("../providers/ark");
+const forfeit_1 = require("../forfeit");
+const validation_1 = require("../tree/validation");
+const _1 = require(".");
+const base_2 = require("../script/base");
+const tapscript_1 = require("../script/tapscript");
+const arkTransaction_1 = require("../utils/arkTransaction");
+const vtxo_manager_1 = require("./vtxo-manager");
+const arknote_1 = require("../arknote");
+const intent_1 = require("../intent");
+const indexer_1 = require("../providers/indexer");
+const unknownFields_1 = require("../utils/unknownFields");
+const utils_1 = require("./utils");
+const errors_1 = require("../providers/errors");
+const batch_1 = require("./batch");
+const arkfee_1 = require("../arkfee");
+const transactionHistory_1 = require("../utils/transactionHistory");
+const repositories_1 = require("../repositories");
+const contractManager_1 = require("../contracts/contractManager");
+const helpers_1 = require("../contracts/handlers/helpers");
+/**
+ * Type guard function to check if an identity has a toReadonly method.
+ */
+function hasToReadonly(identity) {
+    return (typeof identity === "object" &&
+        identity !== null &&
+        "toReadonly" in identity &&
+        typeof identity.toReadonly === "function");
+}
+class ReadonlyWallet {
+    constructor(identity, network, onchainProvider, indexerProvider, arkServerPublicKey, offchainTapscript, boardingTapscript, dustAmount, walletRepository, contractRepository, watcherConfig) {
+        this.identity = identity;
+        this.network = network;
+        this.onchainProvider = onchainProvider;
+        this.indexerProvider = indexerProvider;
+        this.arkServerPublicKey = arkServerPublicKey;
+        this.offchainTapscript = offchainTapscript;
+        this.boardingTapscript = boardingTapscript;
+        this.dustAmount = dustAmount;
+        this.walletRepository = walletRepository;
+        this.contractRepository = contractRepository;
+        this.watcherConfig = watcherConfig;
+    }
+    /**
+     * Protected helper to set up shared wallet configuration.
+     * Extracts common logic used by both ReadonlyWallet.create() and Wallet.create().
+     */
+    static async setupWalletConfig(config, pubkey) {
+        // Use provided arkProvider instance or create a new one from arkServerUrl
+        const arkProvider = config.arkProvider ||
+            (() => {
+                if (!config.arkServerUrl) {
+                    throw new Error("Either arkProvider or arkServerUrl must be provided");
+                }
+                return new ark_1.RestArkProvider(config.arkServerUrl);
+            })();
+        // Extract arkServerUrl from provider if not explicitly provided
+        const arkServerUrl = config.arkServerUrl || arkProvider.serverUrl;
+        if (!arkServerUrl) {
+            throw new Error("Could not determine arkServerUrl from provider");
+        }
+        // Use provided indexerProvider instance or create a new one
+        // indexerUrl defaults to arkServerUrl if not provided
+        const indexerUrl = config.indexerUrl || arkServerUrl;
+        const indexerProvider = config.indexerProvider || new indexer_1.RestIndexerProvider(indexerUrl);
+        const info = await arkProvider.getInfo();
+        const network = (0, networks_1.getNetwork)(info.network);
+        // Extract esploraUrl from provider if not explicitly provided
+        const esploraUrl = config.esploraUrl || onchain_1.ESPLORA_URL[info.network];
+        // Use provided onchainProvider instance or create a new one
+        const onchainProvider = config.onchainProvider || new onchain_1.EsploraProvider(esploraUrl);
+        // validate unilateral exit timelock passed in config if any
+        if (config.exitTimelock) {
+            const { value, type } = config.exitTimelock;
+            if ((value < 512n && type !== "blocks") ||
+                (value >= 512n && type !== "seconds")) {
+                throw new Error("invalid exitTimelock");
+            }
+        }
+        // create unilateral exit timelock
+        const exitTimelock = config.exitTimelock ?? {
+            value: info.unilateralExitDelay,
+            type: info.unilateralExitDelay < 512n ? "blocks" : "seconds",
+        };
+        // validate boarding timelock passed in config if any
+        if (config.boardingTimelock) {
+            const { value, type } = config.boardingTimelock;
+            if ((value < 512n && type !== "blocks") ||
+                (value >= 512n && type !== "seconds")) {
+                throw new Error("invalid boardingTimelock");
+            }
+        }
+        // create boarding timelock
+        const boardingTimelock = config.boardingTimelock ?? {
+            value: info.boardingExitDelay,
+            type: info.boardingExitDelay < 512n ? "blocks" : "seconds",
+        };
+        // Generate tapscripts for offchain and boarding address
+        const serverPubKey = base_1.hex.decode(info.signerPubkey).slice(1);
+        const bareVtxoTapscript = new default_1.DefaultVtxo.Script({
+            pubKey: pubkey,
+            serverPubKey,
+            csvTimelock: exitTimelock,
+        });
+        const boardingTapscript = new default_1.DefaultVtxo.Script({
+            pubKey: pubkey,
+            serverPubKey,
+            csvTimelock: boardingTimelock,
+        });
+        // Save tapscripts
+        const offchainTapscript = bareVtxoTapscript;
+        const walletRepository = config.storage?.walletRepository ?? new repositories_1.IndexedDBWalletRepository();
+        const contractRepository = config.storage?.contractRepository ??
+            new repositories_1.IndexedDBContractRepository();
+        return {
+            arkProvider,
+            indexerProvider,
+            onchainProvider,
+            network,
+            networkName: info.network,
+            serverPubKey,
+            offchainTapscript,
+            boardingTapscript,
+            dustAmount: info.dust,
+            walletRepository,
+            contractRepository,
+            info,
+        };
+    }
+    static async create(config) {
+        const pubkey = await config.identity.xOnlyPublicKey();
+        if (!pubkey) {
+            throw new Error("Invalid configured public key");
+        }
+        const setup = await ReadonlyWallet.setupWalletConfig(config, pubkey);
+        return new ReadonlyWallet(config.identity, setup.network, setup.onchainProvider, setup.indexerProvider, setup.serverPubKey, setup.offchainTapscript, setup.boardingTapscript, setup.dustAmount, setup.walletRepository, setup.contractRepository, config.watcherConfig);
+    }
+    get arkAddress() {
+        return this.offchainTapscript.address(this.network.hrp, this.arkServerPublicKey);
+    }
+    /**
+     * Get the contract script for the wallet's default address.
+     * This is the pkScript hex, used to identify the wallet in ContractManager.
+     */
+    get defaultContractScript() {
+        return base_1.hex.encode(this.offchainTapscript.pkScript);
+    }
+    async getAddress() {
+        return this.arkAddress.encode();
+    }
+    async getBoardingAddress() {
+        return this.boardingTapscript.onchainAddress(this.network);
+    }
+    async getBalance() {
+        const [boardingUtxos, vtxos] = await Promise.all([
+            this.getBoardingUtxos(),
+            this.getVtxos(),
+        ]);
+        // boarding
+        let confirmed = 0;
+        let unconfirmed = 0;
+        for (const utxo of boardingUtxos) {
+            if (utxo.status.confirmed) {
+                confirmed += utxo.value;
+            }
+            else {
+                unconfirmed += utxo.value;
+            }
+        }
+        // offchain
+        let settled = 0;
+        let preconfirmed = 0;
+        let recoverable = 0;
+        settled = vtxos
+            .filter((coin) => coin.virtualStatus.state === "settled")
+            .reduce((sum, coin) => sum + coin.value, 0);
+        preconfirmed = vtxos
+            .filter((coin) => coin.virtualStatus.state === "preconfirmed")
+            .reduce((sum, coin) => sum + coin.value, 0);
+        recoverable = vtxos
+            .filter((coin) => (0, _1.isSpendable)(coin) && coin.virtualStatus.state === "swept")
+            .reduce((sum, coin) => sum + coin.value, 0);
+        const totalBoarding = confirmed + unconfirmed;
+        const totalOffchain = settled + preconfirmed + recoverable;
+        return {
+            boarding: {
+                confirmed,
+                unconfirmed,
+                total: totalBoarding,
+            },
+            settled,
+            preconfirmed,
+            available: settled + preconfirmed,
+            recoverable,
+            total: totalBoarding + totalOffchain,
+        };
+    }
+    // TODO: use contract manager (and repo) will be offline-first
+    async getVtxos(filter) {
+        const address = await this.getAddress();
+        // For now, always fetch fresh data from provider and update cache
+        // In future, we can add cache invalidation logic based on timestamps
+        const vtxos = await this.getVirtualCoins(filter);
+        const extendedVtxos = vtxos.map((vtxo) => (0, utils_1.extendVirtualCoin)(this, vtxo));
+        // Update cache with fresh data
+        await this.walletRepository.saveVtxos(address, extendedVtxos);
+        return extendedVtxos;
+    }
+    async getVirtualCoins(filter = { withRecoverable: true, withUnrolled: false }) {
+        const scripts = [base_1.hex.encode(this.offchainTapscript.pkScript)];
+        const response = await this.indexerProvider.getVtxos({ scripts });
+        const allVtxos = response.vtxos;
+        let vtxos = allVtxos.filter(_1.isSpendable);
+        // all recoverable vtxos are spendable by definition
+        if (!filter.withRecoverable) {
+            vtxos = vtxos.filter((vtxo) => !(0, _1.isRecoverable)(vtxo) && !(0, _1.isExpired)(vtxo));
+        }
+        if (filter.withUnrolled) {
+            const spentVtxos = allVtxos.filter((vtxo) => !(0, _1.isSpendable)(vtxo));
+            vtxos.push(...spentVtxos.filter((vtxo) => vtxo.isUnrolled));
+        }
+        return vtxos;
+    }
+    async getTransactionHistory() {
+        const response = await this.indexerProvider.getVtxos({
+            scripts: [base_1.hex.encode(this.offchainTapscript.pkScript)],
+        });
+        const { boardingTxs, commitmentsToIgnore } = await this.getBoardingTxs();
+        const getTxCreatedAt = (txid) => this.indexerProvider
+            .getVtxos({ outpoints: [{ txid, vout: 0 }] })
+            .then((res) => res.vtxos[0]?.createdAt.getTime() || 0);
+        return (0, transactionHistory_1.buildTransactionHistory)(response.vtxos, boardingTxs, commitmentsToIgnore, getTxCreatedAt);
+    }
+    async getBoardingTxs() {
+        const utxos = [];
+        const commitmentsToIgnore = new Set();
+        const boardingAddress = await this.getBoardingAddress();
+        const txs = await this.onchainProvider.getTransactions(boardingAddress);
+        for (const tx of txs) {
+            for (let i = 0; i < tx.vout.length; i++) {
+                const vout = tx.vout[i];
+                if (vout.scriptpubkey_address === boardingAddress) {
+                    const spentStatuses = await this.onchainProvider.getTxOutspends(tx.txid);
+                    const spentStatus = spentStatuses[i];
+                    if (spentStatus?.spent) {
+                        commitmentsToIgnore.add(spentStatus.txid);
+                    }
+                    utxos.push({
+                        txid: tx.txid,
+                        vout: i,
+                        value: Number(vout.value),
+                        status: {
+                            confirmed: tx.status.confirmed,
+                            block_time: tx.status.block_time,
+                        },
+                        isUnrolled: true,
+                        virtualStatus: {
+                            state: spentStatus?.spent ? "spent" : "settled",
+                            commitmentTxIds: spentStatus?.spent
+                                ? [spentStatus.txid]
+                                : undefined,
+                        },
+                        createdAt: tx.status.confirmed
+                            ? new Date(tx.status.block_time * 1000)
+                            : new Date(0),
+                    });
+                }
+            }
+        }
+        const unconfirmedTxs = [];
+        const confirmedTxs = [];
+        for (const utxo of utxos) {
+            const tx = {
+                key: {
+                    boardingTxid: utxo.txid,
+                    commitmentTxid: "",
+                    arkTxid: "",
+                },
+                amount: utxo.value,
+                type: _1.TxType.TxReceived,
+                settled: utxo.virtualStatus.state === "spent",
+                createdAt: utxo.status.block_time
+                    ? new Date(utxo.status.block_time * 1000).getTime()
+                    : 0,
+            };
+            if (!utxo.status.block_time) {
+                unconfirmedTxs.push(tx);
+            }
+            else {
+                confirmedTxs.push(tx);
+            }
+        }
+        return {
+            boardingTxs: [...unconfirmedTxs, ...confirmedTxs],
+            commitmentsToIgnore,
+        };
+    }
+    async getBoardingUtxos() {
+        const boardingAddress = await this.getBoardingAddress();
+        const boardingUtxos = await this.onchainProvider.getCoins(boardingAddress);
+        const utxos = boardingUtxos.map((utxo) => {
+            return (0, utils_1.extendCoin)(this, utxo);
+        });
+        // Save boardingUtxos using unified repository
+        await this.walletRepository.saveUtxos(boardingAddress, utxos);
+        return utxos;
+    }
+    async notifyIncomingFunds(eventCallback) {
+        const arkAddress = await this.getAddress();
+        const boardingAddress = await this.getBoardingAddress();
+        let onchainStopFunc;
+        let indexerStopFunc;
+        if (this.onchainProvider && boardingAddress) {
+            const findVoutOnTx = (tx) => {
+                return tx.vout.findIndex((v) => v.scriptpubkey_address === boardingAddress);
+            };
+            onchainStopFunc = await this.onchainProvider.watchAddresses([boardingAddress], (txs) => {
+                // find all utxos belonging to our boarding address
+                const coins = txs
+                    // filter txs where address is in output
+                    .filter((tx) => findVoutOnTx(tx) !== -1)
+                    // return utxo as Coin
+                    .map((tx) => {
+                    const { txid, status } = tx;
+                    const vout = findVoutOnTx(tx);
+                    const value = Number(tx.vout[vout].value);
+                    return { txid, vout, value, status };
+                });
+                // and notify via callback
+                eventCallback({
+                    type: "utxo",
+                    coins,
+                });
+            });
+        }
+        if (this.indexerProvider && arkAddress) {
+            const offchainScript = this.offchainTapscript;
+            const subscriptionId = await this.indexerProvider.subscribeForScripts([
+                base_1.hex.encode(offchainScript.pkScript),
+            ]);
+            const abortController = new AbortController();
+            const subscription = this.indexerProvider.getSubscription(subscriptionId, abortController.signal);
+            indexerStopFunc = async () => {
+                abortController.abort();
+                await this.indexerProvider?.unsubscribeForScripts(subscriptionId);
+            };
+            // Handle subscription updates asynchronously without blocking
+            (async () => {
+                try {
+                    for await (const update of subscription) {
+                        if (update.newVtxos?.length > 0 ||
+                            update.spentVtxos?.length > 0) {
+                            eventCallback({
+                                type: "vtxo",
+                                newVtxos: update.newVtxos.map((vtxo) => (0, utils_1.extendVirtualCoin)(this, vtxo)),
+                                spentVtxos: update.spentVtxos.map((vtxo) => (0, utils_1.extendVirtualCoin)(this, vtxo)),
+                            });
+                        }
+                    }
+                }
+                catch (error) {
+                    console.error("Subscription error:", error);
+                }
+            })();
+        }
+        const stopFunc = () => {
+            onchainStopFunc?.();
+            indexerStopFunc?.();
+        };
+        return stopFunc;
+    }
+    async fetchPendingTxs() {
+        // get non-swept VTXOs, rely on the indexer only in case DB doesn't have the right state
+        const scripts = [base_1.hex.encode(this.offchainTapscript.pkScript)];
+        let { vtxos } = await this.indexerProvider.getVtxos({
+            scripts,
+        });
+        return vtxos
+            .filter((vtxo) => vtxo.virtualStatus.state !== "swept" &&
+            vtxo.virtualStatus.state !== "settled" &&
+            vtxo.arkTxId !== undefined)
+            .map((_) => _.arkTxId);
+    }
+    // ========================================================================
+    // Contract Management
+    // ========================================================================
+    /**
+     * Get the ContractManager for managing contracts including the wallet's default address.
+     *
+     * The ContractManager handles:
+     * - The wallet's default receiving address (as a "default" contract)
+     * - External contracts (Boltz swaps, HTLCs, etc.)
+     * - Multi-contract watching with resilient connections
+     *
+     * @example
+     * ```typescript
+     * const manager = await wallet.getContractManager();
+     *
+     * // Create a contract for a Boltz swap
+     * const contract = await manager.createContract({
+     *   label: "Boltz Swap",
+     *   type: "vhtlc",
+     *   params: { ... },
+     *   script: swapScript,
+     *   address: swapAddress,
+     * });
+     *
+     * // Start watching for events (includes wallet's default address)
+     * const stop = await manager.onContractEvent((event) => {
+     *   console.log(`${event.type} on ${event.contractScript}`);
+     * });
+     * ```
+     */
+    async getContractManager() {
+        // Return existing manager if already initialized
+        if (this._contractManager) {
+            return this._contractManager;
+        }
+        // If initialization is in progress, wait for it
+        if (this._contractManagerInitializing) {
+            return this._contractManagerInitializing;
+        }
+        // Start initialization and store the promise
+        this._contractManagerInitializing = this.initializeContractManager();
+        try {
+            const manager = await this._contractManagerInitializing;
+            this._contractManager = manager;
+            return manager;
+        }
+        catch (error) {
+            // Clear the initializing promise so subsequent calls can retry
+            this._contractManagerInitializing = undefined;
+            throw error;
+        }
+        finally {
+            // Clear the initializing promise after completion
+            this._contractManagerInitializing = undefined;
+        }
+    }
+    async initializeContractManager() {
+        const manager = await contractManager_1.ContractManager.create({
+            indexerProvider: this.indexerProvider,
+            contractRepository: this.contractRepository,
+            walletRepository: this.walletRepository,
+            extendVtxo: (vtxo) => (0, utils_1.extendVirtualCoin)(this, vtxo),
+            getDefaultAddress: () => this.getAddress(),
+            watcherConfig: this.watcherConfig,
+        });
+        // Register the wallet's default address as a contract
+        // This ensures it's watched alongside any external contracts
+        // Script is the unique contract identifier, so no need to specify it explicitly
+        const csvTimelock = this.offchainTapscript.options.csvTimelock ??
+            default_1.DefaultVtxo.Script.DEFAULT_TIMELOCK;
+        await manager.createContract({
+            type: "default",
+            params: {
+                pubKey: base_1.hex.encode(this.offchainTapscript.options.pubKey),
+                serverPubKey: base_1.hex.encode(this.offchainTapscript.options.serverPubKey),
+                csvTimelock: (0, helpers_1.timelockToSequence)(csvTimelock).toString(),
+            },
+            script: this.defaultContractScript,
+            address: await this.getAddress(),
+            state: "active",
+        });
+        return manager;
+    }
+}
+exports.ReadonlyWallet = ReadonlyWallet;
+/**
+ * Main wallet implementation for Bitcoin transactions with Ark protocol support.
+ * The wallet does not store any data locally and relies on Ark and onchain
+ * providers to fetch UTXOs and VTXOs.
+ *
+ * @example
+ * ```typescript
+ * // Create a wallet with URL configuration
+ * const wallet = await Wallet.create({
+ *   identity: SingleKey.fromHex('your_private_key'),
+ *   arkServerUrl: 'https://ark.example.com',
+ *   esploraUrl: 'https://mempool.space/api'
+ * });
+ *
+ * // Or with custom provider instances (e.g., for Expo/React Native)
+ * const wallet = await Wallet.create({
+ *   identity: SingleKey.fromHex('your_private_key'),
+ *   arkProvider: new ExpoArkProvider('https://ark.example.com'),
+ *   indexerProvider: new ExpoIndexerProvider('https://ark.example.com'),
+ *   esploraUrl: 'https://mempool.space/api'
+ * });
+ *
+ * // Get addresses
+ * const arkAddress = await wallet.getAddress();
+ * const boardingAddress = await wallet.getBoardingAddress();
+ *
+ * // Send bitcoin
+ * const txid = await wallet.sendBitcoin({
+ *   address: 'tb1...',
+ *   amount: 50000
+ * });
+ * ```
+ */
+class Wallet extends ReadonlyWallet {
+    constructor(identity, network, networkName, onchainProvider, arkProvider, indexerProvider, arkServerPublicKey, offchainTapscript, boardingTapscript, serverUnrollScript, forfeitOutputScript, forfeitPubkey, dustAmount, walletRepository, contractRepository, renewalConfig, watcherConfig) {
+        super(identity, network, onchainProvider, indexerProvider, arkServerPublicKey, offchainTapscript, boardingTapscript, dustAmount, walletRepository, contractRepository, watcherConfig);
+        this.networkName = networkName;
+        this.arkProvider = arkProvider;
+        this.serverUnrollScript = serverUnrollScript;
+        this.forfeitOutputScript = forfeitOutputScript;
+        this.forfeitPubkey = forfeitPubkey;
+        this.identity = identity;
+        this.renewalConfig = {
+            enabled: renewalConfig?.enabled ?? false,
+            ...vtxo_manager_1.DEFAULT_RENEWAL_CONFIG,
+            ...renewalConfig,
+        };
+    }
+    static async create(config) {
+        const pubkey = await config.identity.xOnlyPublicKey();
+        if (!pubkey) {
+            throw new Error("Invalid configured public key");
+        }
+        const setup = await ReadonlyWallet.setupWalletConfig(config, pubkey);
+        // Compute Wallet-specific forfeit and unroll scripts
+        // the serverUnrollScript is the one used to create output scripts of the checkpoint transactions
+        let serverUnrollScript;
+        try {
+            const raw = base_1.hex.decode(setup.info.checkpointTapscript);
+            serverUnrollScript = tapscript_1.CSVMultisigTapscript.decode(raw);
+        }
+        catch (e) {
+            throw new Error("Invalid checkpointTapscript from server");
+        }
+        // parse the server forfeit address
+        // server is expecting funds to be sent to this address
+        const forfeitPubkey = base_1.hex.decode(setup.info.forfeitPubkey).slice(1);
+        const forfeitAddress = (0, btc_signer_1.Address)(setup.network).decode(setup.info.forfeitAddress);
+        const forfeitOutputScript = btc_signer_1.OutScript.encode(forfeitAddress);
+        return new Wallet(config.identity, setup.network, setup.networkName, setup.onchainProvider, setup.arkProvider, setup.indexerProvider, setup.serverPubKey, setup.offchainTapscript, setup.boardingTapscript, serverUnrollScript, forfeitOutputScript, forfeitPubkey, setup.dustAmount, setup.walletRepository, setup.contractRepository, config.renewalConfig, config.watcherConfig);
+    }
+    /**
+     * Convert this wallet to a readonly wallet.
+     *
+     * @returns A readonly wallet with the same configuration but readonly identity
+     * @example
+     * ```typescript
+     * const wallet = await Wallet.create({ identity: SingleKey.fromHex('...'), ... });
+     * const readonlyWallet = await wallet.toReadonly();
+     *
+     * // Can query balance and addresses
+     * const balance = await readonlyWallet.getBalance();
+     * const address = await readonlyWallet.getAddress();
+     *
+     * // But cannot send transactions (type error)
+     * // readonlyWallet.sendBitcoin(...); // TypeScript error
+     * ```
+     */
+    async toReadonly() {
+        // Check if the identity has a toReadonly method using type guard
+        const readonlyIdentity = hasToReadonly(this.identity)
+            ? await this.identity.toReadonly()
+            : this.identity; // Identity extends ReadonlyIdentity, so this is safe
+        return new ReadonlyWallet(readonlyIdentity, this.network, this.onchainProvider, this.indexerProvider, this.arkServerPublicKey, this.offchainTapscript, this.boardingTapscript, this.dustAmount, this.walletRepository, this.contractRepository, this.watcherConfig);
+    }
+    async sendBitcoin(params) {
+        if (params.amount <= 0) {
+            throw new Error("Amount must be positive");
+        }
+        if (!isValidArkAddress(params.address)) {
+            throw new Error("Invalid Ark address " + params.address);
+        }
+        // recoverable and subdust coins can't be spent in offchain tx
+        const virtualCoins = await this.getVirtualCoins({
+            withRecoverable: false,
+        });
+        let selected;
+        if (params.selectedVtxos) {
+            const selectedVtxoSum = params.selectedVtxos
+                .map((v) => v.value)
+                .reduce((a, b) => a + b, 0);
+            if (selectedVtxoSum < params.amount) {
+                throw new Error("Selected VTXOs do not cover specified amount");
+            }
+            const changeAmount = selectedVtxoSum - params.amount;
+            selected = {
+                inputs: params.selectedVtxos,
+                changeAmount: BigInt(changeAmount),
+            };
+        }
+        else {
+            selected = selectVirtualCoins(virtualCoins, params.amount);
+        }
+        const selectedLeaf = this.offchainTapscript.forfeit();
+        if (!selectedLeaf) {
+            throw new Error("Selected leaf not found");
+        }
+        const outputAddress = address_1.ArkAddress.decode(params.address);
+        const outputScript = BigInt(params.amount) < this.dustAmount
+            ? outputAddress.subdustPkScript
+            : outputAddress.pkScript;
+        const outputs = [
+            {
+                script: outputScript,
+                amount: BigInt(params.amount),
+            },
+        ];
+        // add change output if needed
+        if (selected.changeAmount > 0n) {
+            const changeOutputScript = selected.changeAmount < this.dustAmount
+                ? this.arkAddress.subdustPkScript
+                : this.arkAddress.pkScript;
+            outputs.push({
+                script: changeOutputScript,
+                amount: BigInt(selected.changeAmount),
+            });
+        }
+        const tapTree = this.offchainTapscript.encode();
+        const offchainTx = (0, arkTransaction_1.buildOffchainTx)(selected.inputs.map((input) => ({
+            ...input,
+            tapLeafScript: selectedLeaf,
+            tapTree,
+        })), outputs, this.serverUnrollScript);
+        const signedVirtualTx = await this.identity.sign(offchainTx.arkTx);
+        const { arkTxid, signedCheckpointTxs } = await this.arkProvider.submitTx(base_1.base64.encode(signedVirtualTx.toPSBT()), offchainTx.checkpoints.map((c) => base_1.base64.encode(c.toPSBT())));
+        // sign the checkpoints
+        const finalCheckpoints = await Promise.all(signedCheckpointTxs.map(async (c) => {
+            const tx = btc_signer_1.Transaction.fromPSBT(base_1.base64.decode(c));
+            const signedCheckpoint = await this.identity.sign(tx);
+            return base_1.base64.encode(signedCheckpoint.toPSBT());
+        }));
+        await this.arkProvider.finalizeTx(arkTxid, finalCheckpoints);
+        try {
+            // mark VTXOs as spent and optionally add the change VTXO
+            const spentVtxos = [];
+            const commitmentTxIds = new Set();
+            let batchExpiry = Number.MAX_SAFE_INTEGER;
+            for (const [inputIndex, input] of selected.inputs.entries()) {
+                const vtxo = (0, utils_1.extendVirtualCoin)(this, input);
+                const checkpointB64 = signedCheckpointTxs[inputIndex];
+                const checkpoint = btc_signer_1.Transaction.fromPSBT(base_1.base64.decode(checkpointB64));
+                spentVtxos.push({
+                    ...vtxo,
+                    virtualStatus: { ...vtxo.virtualStatus, state: "spent" },
+                    spentBy: checkpoint.id,
+                    arkTxId: arkTxid,
+                    isSpent: true,
+                });
+                if (vtxo.virtualStatus.commitmentTxIds) {
+                    for (const commitmentTxId of vtxo.virtualStatus
+                        .commitmentTxIds) {
+                        commitmentTxIds.add(commitmentTxId);
+                    }
+                }
+                if (vtxo.virtualStatus.batchExpiry) {
+                    batchExpiry = Math.min(batchExpiry, vtxo.virtualStatus.batchExpiry);
+                }
+            }
+            const createdAt = Date.now();
+            const addr = this.arkAddress.encode();
+            if (selected.changeAmount > 0n &&
+                batchExpiry !== Number.MAX_SAFE_INTEGER) {
+                const changeVtxo = {
+                    txid: arkTxid,
+                    vout: outputs.length - 1,
+                    createdAt: new Date(createdAt),
+                    forfeitTapLeafScript: this.offchainTapscript.forfeit(),
+                    intentTapLeafScript: this.offchainTapscript.forfeit(),
+                    isUnrolled: false,
+                    isSpent: false,
+                    tapTree: this.offchainTapscript.encode(),
+                    value: Number(selected.changeAmount),
+                    virtualStatus: {
+                        state: "preconfirmed",
+                        commitmentTxIds: Array.from(commitmentTxIds),
+                        batchExpiry,
+                    },
+                    status: {
+                        confirmed: false,
+                    },
+                };
+                await this.walletRepository.saveVtxos(addr, [changeVtxo]);
+            }
+            await this.walletRepository.saveVtxos(addr, spentVtxos);
+            await this.walletRepository.saveTransactions(addr, [
+                {
+                    key: {
+                        boardingTxid: "",
+                        commitmentTxid: "",
+                        arkTxid: arkTxid,
+                    },
+                    amount: params.amount,
+                    type: _1.TxType.TxSent,
+                    settled: false,
+                    createdAt: Date.now(),
+                },
+            ]);
+        }
+        catch (e) {
+            console.warn("error saving offchain tx to repository", e);
+        }
+        finally {
+            return arkTxid;
+        }
+    }
+    async settle(params, eventCallback) {
+        if (params?.inputs) {
+            for (const input of params.inputs) {
+                // validate arknotes inputs
+                if (typeof input === "string") {
+                    try {
+                        arknote_1.ArkNote.fromString(input);
+                    }
+                    catch (e) {
+                        throw new Error(`Invalid arknote "${input}"`);
+                    }
+                }
+            }
+        }
+        // if no params are provided, use all non expired boarding utxos and offchain vtxos as inputs
+        // and send all to the offchain address
+        if (!params) {
+            const { fees } = await this.arkProvider.getInfo();
+            const estimator = new arkfee_1.Estimator(fees.intentFee);
+            let amount = 0;
+            const exitScript = tapscript_1.CSVMultisigTapscript.decode(base_1.hex.decode(this.boardingTapscript.exitScript));
+            const boardingTimelock = exitScript.params.timelock;
+            const boardingUtxos = (await this.getBoardingUtxos()).filter((utxo) => !(0, arkTransaction_1.hasBoardingTxExpired)(utxo, boardingTimelock));
+            const filteredBoardingUtxos = [];
+            for (const utxo of boardingUtxos) {
+                const inputFee = estimator.evalOnchainInput({
+                    amount: BigInt(utxo.value),
+                });
+                if (inputFee.value >= utxo.value) {
+                    // skip if fees are greater than the utxo value
+                    continue;
+                }
+                filteredBoardingUtxos.push(utxo);
+                amount += utxo.value - inputFee.satoshis;
+            }
+            const vtxos = await this.getVtxos({ withRecoverable: true });
+            const filteredVtxos = [];
+            for (const vtxo of vtxos) {
+                const inputFee = estimator.evalOffchainInput({
+                    amount: BigInt(vtxo.value),
+                    type: vtxo.virtualStatus.state === "swept"
+                        ? "recoverable"
+                        : "vtxo",
+                    weight: 0,
+                    birth: vtxo.createdAt,
+                    expiry: vtxo.virtualStatus.batchExpiry
+                        ? new Date(vtxo.virtualStatus.batchExpiry * 1000)
+                        : new Date(),
+                });
+                if (inputFee.value >= vtxo.value) {
+                    // skip if fees are greater than the vtxo value
+                    continue;
+                }
+                filteredVtxos.push(vtxo);
+                amount += vtxo.value - inputFee.satoshis;
+            }
+            const inputs = [...filteredBoardingUtxos, ...filteredVtxos];
+            if (inputs.length === 0) {
+                throw new Error("No inputs found");
+            }
+            const output = {
+                address: await this.getAddress(),
+                amount: BigInt(amount),
+            };
+            const outputFee = estimator.evalOffchainOutput({
+                amount: output.amount,
+                script: base_1.hex.encode(address_1.ArkAddress.decode(output.address).pkScript),
+            });
+            output.amount -= BigInt(outputFee.satoshis);
+            if (output.amount <= this.dustAmount) {
+                throw new Error("Output amount is below dust limit");
+            }
+            params = {
+                inputs,
+                outputs: [output],
+            };
+        }
+        const onchainOutputIndexes = [];
+        const outputs = [];
+        let hasOffchainOutputs = false;
+        for (const [index, output] of params.outputs.entries()) {
+            let script;
+            try {
+                // offchain
+                const addr = address_1.ArkAddress.decode(output.address);
+                script = addr.pkScript;
+                hasOffchainOutputs = true;
+            }
+            catch {
+                // onchain
+                const addr = (0, btc_signer_1.Address)(this.network).decode(output.address);
+                script = btc_signer_1.OutScript.encode(addr);
+                onchainOutputIndexes.push(index);
+            }
+            outputs.push({
+                amount: output.amount,
+                script,
+            });
+        }
+        // session holds the state of the musig2 signing process of the vtxo tree
+        let session;
+        const signingPublicKeys = [];
+        if (hasOffchainOutputs) {
+            session = this.identity.signerSession();
+            signingPublicKeys.push(base_1.hex.encode(await session.getPublicKey()));
+        }
+        const [intent, deleteIntent] = await Promise.all([
+            this.makeRegisterIntentSignature(params.inputs, outputs, onchainOutputIndexes, signingPublicKeys),
+            this.makeDeleteIntentSignature(params.inputs),
+        ]);
+        const intentId = await this.safeRegisterIntent(intent);
+        const topics = [
+            ...signingPublicKeys,
+            ...params.inputs.map((input) => `${input.txid}:${input.vout}`),
+        ];
+        const handler = this.createBatchHandler(intentId, params.inputs, session);
+        const abortController = new AbortController();
+        try {
+            const stream = this.arkProvider.getEventStream(abortController.signal, topics);
+            return await batch_1.Batch.join(stream, handler, {
+                abortController,
+                skipVtxoTreeSigning: !hasOffchainOutputs,
+                eventCallback: eventCallback
+                    ? (event) => Promise.resolve(eventCallback(event))
+                    : undefined,
+            });
+        }
+        catch (error) {
+            // delete the intent to not be stuck in the queue
+            await this.arkProvider.deleteIntent(deleteIntent).catch(() => { });
+            throw error;
+        }
+        finally {
+            // close the stream
+            abortController.abort();
+        }
+    }
+    async handleSettlementFinalizationEvent(event, inputs, forfeitOutputScript, connectorsGraph) {
+        // the signed forfeits transactions to submit
+        const signedForfeits = [];
+        const vtxos = await this.getVirtualCoins();
+        let settlementPsbt = btc_signer_1.Transaction.fromPSBT(base_1.base64.decode(event.commitmentTx));
+        let hasBoardingUtxos = false;
+        let connectorIndex = 0;
+        const connectorsLeaves = connectorsGraph?.leaves() || [];
+        for (const input of inputs) {
+            // check if the input is an offchain "virtual" coin
+            const vtxo = vtxos.find((vtxo) => vtxo.txid === input.txid && vtxo.vout === input.vout);
+            // boarding utxo, we need to sign the settlement tx
+            if (!vtxo) {
+                for (let i = 0; i < settlementPsbt.inputsLength; i++) {
+                    const settlementInput = settlementPsbt.getInput(i);
+                    if (!settlementInput.txid ||
+                        settlementInput.index === undefined) {
+                        throw new Error("The server returned incomplete data. No settlement input found in the PSBT");
+                    }
+                    const inputTxId = base_1.hex.encode(settlementInput.txid);
+                    if (inputTxId !== input.txid)
+                        continue;
+                    if (settlementInput.index !== input.vout)
+                        continue;
+                    // input found in the settlement tx, sign it
+                    settlementPsbt.updateInput(i, {
+                        tapLeafScript: [input.forfeitTapLeafScript],
+                    });
+                    settlementPsbt = await this.identity.sign(settlementPsbt, [
+                        i,
+                    ]);
+                    hasBoardingUtxos = true;
+                    break;
+                }
+                continue;
+            }
+            if ((0, _1.isRecoverable)(vtxo) || (0, _1.isSubdust)(vtxo, this.dustAmount)) {
+                // recoverable or subdust coin, we don't need to create a forfeit tx
+                continue;
+            }
+            if (connectorsLeaves.length === 0) {
+                throw new Error("connectors not received");
+            }
+            if (connectorIndex >= connectorsLeaves.length) {
+                throw new Error("not enough connectors received");
+            }
+            const connectorLeaf = connectorsLeaves[connectorIndex];
+            const connectorTxId = connectorLeaf.id;
+            const connectorOutput = connectorLeaf.getOutput(0);
+            if (!connectorOutput) {
+                throw new Error("connector output not found");
+            }
+            const connectorAmount = connectorOutput.amount;
+            const connectorPkScript = connectorOutput.script;
+            if (!connectorAmount || !connectorPkScript) {
+                throw new Error("invalid connector output");
+            }
+            connectorIndex++;
+            let forfeitTx = (0, forfeit_1.buildForfeitTx)([
+                {
+                    txid: input.txid,
+                    index: input.vout,
+                    witnessUtxo: {
+                        amount: BigInt(vtxo.value),
+                        script: base_2.VtxoScript.decode(input.tapTree).pkScript,
+                    },
+                    sighashType: btc_signer_1.SigHash.DEFAULT,
+                    tapLeafScript: [input.forfeitTapLeafScript],
+                },
+                {
+                    txid: connectorTxId,
+                    index: 0,
+                    witnessUtxo: {
+                        amount: connectorAmount,
+                        script: connectorPkScript,
+                    },
+                },
+            ], forfeitOutputScript);
+            // do not sign the connector input
+            forfeitTx = await this.identity.sign(forfeitTx, [0]);
+            signedForfeits.push(base_1.base64.encode(forfeitTx.toPSBT()));
+        }
+        if (signedForfeits.length > 0 || hasBoardingUtxos) {
+            await this.arkProvider.submitSignedForfeitTxs(signedForfeits, hasBoardingUtxos
+                ? base_1.base64.encode(settlementPsbt.toPSBT())
+                : undefined);
+        }
+    }
+    /**
+     * @implements Batch.Handler interface.
+     * @param intentId - The intent ID.
+     * @param inputs - The inputs of the intent.
+     * @param session - The musig2 signing session, if not provided, the signing will be skipped.
+     */
+    createBatchHandler(intentId, inputs, session) {
+        let sweepTapTreeRoot;
+        return {
+            onBatchStarted: async (event) => {
+                const utf8IntentId = new TextEncoder().encode(intentId);
+                const intentIdHash = (0, utils_js_1.sha256)(utf8IntentId);
+                const intentIdHashStr = base_1.hex.encode(intentIdHash);
+                let skip = true;
+                // check if our intent ID hash matches any in the event
+                for (const idHash of event.intentIdHashes) {
+                    if (idHash === intentIdHashStr) {
+                        if (!this.arkProvider) {
+                            throw new Error("Ark provider not configured");
+                        }
+                        await this.arkProvider.confirmRegistration(intentId);
+                        skip = false;
+                    }
+                }
+                if (skip) {
+                    return { skip };
+                }
+                const sweepTapscript = tapscript_1.CSVMultisigTapscript.encode({
+                    timelock: {
+                        value: event.batchExpiry,
+                        type: event.batchExpiry >= 512n ? "seconds" : "blocks",
+                    },
+                    pubkeys: [this.forfeitPubkey],
+                }).script;
+                sweepTapTreeRoot = (0, payment_js_1.tapLeafHash)(sweepTapscript);
+                return { skip: false };
+            },
+            onTreeSigningStarted: async (event, vtxoTree) => {
+                if (!session) {
+                    return { skip: true };
+                }
+                if (!sweepTapTreeRoot) {
+                    throw new Error("Sweep tap tree root not set");
+                }
+                const xOnlyPublicKeys = event.cosignersPublicKeys.map((k) => k.slice(2));
+                const signerPublicKey = await session.getPublicKey();
+                const xonlySignerPublicKey = signerPublicKey.subarray(1);
+                if (!xOnlyPublicKeys.includes(base_1.hex.encode(xonlySignerPublicKey))) {
+                    // not a cosigner, skip the signing
+                    return { skip: true };
+                }
+                // validate the unsigned vtxo tree
+                const commitmentTx = btc_signer_1.Transaction.fromPSBT(base_1.base64.decode(event.unsignedCommitmentTx));
+                (0, validation_1.validateVtxoTxGraph)(vtxoTree, commitmentTx, sweepTapTreeRoot);
+                // TODO check if our registered outputs are in the vtxo tree
+                const sharedOutput = commitmentTx.getOutput(0);
+                if (!sharedOutput?.amount) {
+                    throw new Error("Shared output not found");
+                }
+                await session.init(vtxoTree, sweepTapTreeRoot, sharedOutput.amount);
+                const pubkey = base_1.hex.encode(await session.getPublicKey());
+                const nonces = await session.getNonces();
+                await this.arkProvider.submitTreeNonces(event.id, pubkey, nonces);
+                return { skip: false };
+            },
+            onTreeNonces: async (event) => {
+                if (!session) {
+                    return { fullySigned: true }; // Signing complete (no signing needed)
+                }
+                const { hasAllNonces } = await session.aggregatedNonces(event.txid, event.nonces);
+                // wait to receive and aggregate all nonces before sending signatures
+                if (!hasAllNonces)
+                    return { fullySigned: false };
+                const signatures = await session.sign();
+                const pubkey = base_1.hex.encode(await session.getPublicKey());
+                await this.arkProvider.submitTreeSignatures(event.id, pubkey, signatures);
+                return { fullySigned: true };
+            },
+            onBatchFinalization: async (event, _, connectorTree) => {
+                if (!this.forfeitOutputScript) {
+                    throw new Error("Forfeit output script not set");
+                }
+                if (connectorTree) {
+                    (0, validation_1.validateConnectorsTxGraph)(event.commitmentTx, connectorTree);
+                }
+                await this.handleSettlementFinalizationEvent(event, inputs, this.forfeitOutputScript, connectorTree);
+            },
+        };
+    }
+    async safeRegisterIntent(intent) {
+        try {
+            return await this.arkProvider.registerIntent(intent);
+        }
+        catch (error) {
+            // catch the "already registered by another intent" error
+            if (error instanceof errors_1.ArkError &&
+                error.code === 0 &&
+                error.message.includes("duplicated input")) {
+                // delete all intents spending one of the wallet coins
+                const allSpendableCoins = await this.getVtxos({
+                    withRecoverable: true,
+                });
+                const deleteIntent = await this.makeDeleteIntentSignature(allSpendableCoins);
+                await this.arkProvider.deleteIntent(deleteIntent);
+                // try again
+                return this.arkProvider.registerIntent(intent);
+            }
+            throw error;
+        }
+    }
+    async makeRegisterIntentSignature(coins, outputs, onchainOutputsIndexes, cosignerPubKeys) {
+        const inputs = this.prepareIntentProofInputs(coins);
+        const message = {
+            type: "register",
+            onchain_output_indexes: onchainOutputsIndexes,
+            valid_at: 0,
+            expire_at: 0,
+            cosigners_public_keys: cosignerPubKeys,
+        };
+        const proof = intent_1.Intent.create(message, inputs, outputs);
+        const signedProof = await this.identity.sign(proof);
+        return {
+            proof: base_1.base64.encode(signedProof.toPSBT()),
+            message,
+        };
+    }
+    async makeDeleteIntentSignature(coins) {
+        const inputs = this.prepareIntentProofInputs(coins);
+        const message = {
+            type: "delete",
+            expire_at: 0,
+        };
+        const proof = intent_1.Intent.create(message, inputs, []);
+        const signedProof = await this.identity.sign(proof);
+        return {
+            proof: base_1.base64.encode(signedProof.toPSBT()),
+            message,
+        };
+    }
+    async makeGetPendingTxIntentSignature(vtxos) {
+        const inputs = this.prepareIntentProofInputs(vtxos);
+        const message = {
+            type: "get-pending-tx",
+            expire_at: 0,
+        };
+        const proof = intent_1.Intent.create(message, inputs, []);
+        const signedProof = await this.identity.sign(proof);
+        return {
+            proof: base_1.base64.encode(signedProof.toPSBT()),
+            message,
+        };
+    }
+    /**
+     * Finalizes pending transactions by retrieving them from the server and finalizing each one.
+     * @param vtxos - Optional list of VTXOs to use instead of retrieving them from the server
+     * @returns Array of transaction IDs that were finalized
+     */
+    async finalizePendingTxs(vtxos) {
+        const MAX_INPUTS_PER_INTENT = 20;
+        if (!vtxos || vtxos.length === 0) {
+            // get non-swept VTXOs, rely on the indexer only in case DB doesn't have the right state
+            const scripts = [base_1.hex.encode(this.offchainTapscript.pkScript)];
+            let { vtxos: fetchedVtxos } = await this.indexerProvider.getVtxos({
+                scripts,
+            });
+            fetchedVtxos = fetchedVtxos.filter((vtxo) => vtxo.virtualStatus.state !== "swept" &&
+                vtxo.virtualStatus.state !== "settled");
+            if (fetchedVtxos.length === 0) {
+                return { finalized: [], pending: [] };
+            }
+            vtxos = fetchedVtxos.map((v) => (0, utils_1.extendVirtualCoin)(this, v));
+        }
+        const finalized = [];
+        const pending = [];
+        for (let i = 0; i < vtxos.length; i += MAX_INPUTS_PER_INTENT) {
+            const batch = vtxos.slice(i, i + MAX_INPUTS_PER_INTENT);
+            const intent = await this.makeGetPendingTxIntentSignature(batch);
+            const pendingTxs = await this.arkProvider.getPendingTxs(intent);
+            // finalize each transaction by signing the checkpoints
+            for (const pendingTx of pendingTxs) {
+                pending.push(pendingTx.arkTxid);
+                try {
+                    // sign the checkpoints
+                    const finalCheckpoints = await Promise.all(pendingTx.signedCheckpointTxs.map(async (c) => {
+                        const tx = btc_signer_1.Transaction.fromPSBT(base_1.base64.decode(c));
+                        const signedCheckpoint = await this.identity.sign(tx);
+                        return base_1.base64.encode(signedCheckpoint.toPSBT());
+                    }));
+                    await this.arkProvider.finalizeTx(pendingTx.arkTxid, finalCheckpoints);
+                    finalized.push(pendingTx.arkTxid);
+                }
+                catch (error) {
+                    console.error(`Failed to finalize transaction ${pendingTx.arkTxid}:`, error);
+                    // continue with other transactions even if one fails
+                }
+            }
+        }
+        return { finalized, pending };
+    }
+    prepareIntentProofInputs(coins) {
+        const inputs = [];
+        for (const input of coins) {
+            const vtxoScript = base_2.VtxoScript.decode(input.tapTree);
+            const sequence = getSequence(input.intentTapLeafScript);
+            const unknown = [unknownFields_1.VtxoTaprootTree.encode(input.tapTree)];
+            if (input.extraWitness) {
+                unknown.push(unknownFields_1.ConditionWitness.encode(input.extraWitness));
+            }
+            inputs.push({
+                txid: base_1.hex.decode(input.txid),
+                index: input.vout,
+                witnessUtxo: {
+                    amount: BigInt(input.value),
+                    script: vtxoScript.pkScript,
+                },
+                sequence,
+                tapLeafScript: [input.intentTapLeafScript],
+                unknown,
+            });
+        }
+        return inputs;
+    }
+}
+exports.Wallet = Wallet;
+Wallet.MIN_FEE_RATE = 1; // sats/vbyte
+function getSequence(tapLeafScript) {
+    let sequence = undefined;
+    try {
+        const scriptWithLeafVersion = tapLeafScript[1];
+        const script = scriptWithLeafVersion.subarray(0, scriptWithLeafVersion.length - 1);
+        try {
+            const params = tapscript_1.CSVMultisigTapscript.decode(script).params;
+            sequence = bip68.encode(params.timelock.type === "blocks"
+                ? { blocks: Number(params.timelock.value) }
+                : { seconds: Number(params.timelock.value) });
+        }
+        catch {
+            const params = tapscript_1.CLTVMultisigTapscript.decode(script).params;
+            sequence = Number(params.absoluteTimelock);
+        }
+    }
+    catch { }
+    return sequence;
+}
+function isValidArkAddress(address) {
+    try {
+        address_1.ArkAddress.decode(address);
+        return true;
+    }
+    catch (e) {
+        return false;
+    }
+}
+/**
+ * Select virtual coins to reach a target amount, prioritizing those closer to expiry
+ * @param coins List of virtual coins to select from
+ * @param targetAmount Target amount to reach in satoshis
+ * @returns Selected coins and change amount
+ */
+function selectVirtualCoins(coins, targetAmount) {
+    // Sort VTXOs by expiry (ascending) and amount (descending)
+    const sortedCoins = [...coins].sort((a, b) => {
+        // First sort by expiry if available
+        const expiryA = a.virtualStatus.batchExpiry || Number.MAX_SAFE_INTEGER;
+        const expiryB = b.virtualStatus.batchExpiry || Number.MAX_SAFE_INTEGER;
+        if (expiryA !== expiryB) {
+            return expiryA - expiryB; // Earlier expiry first
+        }
+        // Then sort by amount
+        return b.value - a.value; // Larger amount first
+    });
+    const selectedCoins = [];
+    let selectedAmount = 0;
+    // Select coins until we have enough
+    for (const coin of sortedCoins) {
+        selectedCoins.push(coin);
+        selectedAmount += coin.value;
+        if (selectedAmount >= targetAmount) {
+            break;
+        }
+    }
+    if (selectedAmount === targetAmount) {
+        return { inputs: selectedCoins, changeAmount: 0n };
+    }
+    // Check if we have enough
+    if (selectedAmount < targetAmount) {
+        throw new Error("Insufficient funds");
+    }
+    const changeAmount = BigInt(selectedAmount - targetAmount);
+    return {
+        inputs: selectedCoins,
+        changeAmount,
+    };
+}
+/**
+ * Wait for incoming funds to the wallet
+ * @param wallet - The wallet to wait for incoming funds
+ * @returns A promise that resolves the next new coins received by the wallet's address
+ */
+async function waitForIncomingFunds(wallet) {
+    let stopFunc;
+    const promise = new Promise((resolve) => {
+        wallet
+            .notifyIncomingFunds((coins) => {
+            resolve(coins);
+            if (stopFunc)
+                stopFunc();
+        })
+            .then((stop) => {
+            stopFunc = stop;
+        });
+    });
+    return promise;
+}
